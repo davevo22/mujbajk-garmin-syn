@@ -1,0 +1,37 @@
+name: Sync Garmin gear km
+
+on:
+  schedule:
+    # Každý den v 6:00 UTC (cca 7:00 nebo 8:00 našeho času podle letního/zimního)
+    - cron: "0 6 * * *"
+  workflow_dispatch: {} # umožní ruční spuštění tlačítkem v záložce Actions
+
+permissions:
+  contents: write # skript potřebuje zapisovat km.json zpátky do repa
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run sync script
+        env:
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          GEAR_NAME_FILTER: ${{ vars.GEAR_NAME_FILTER }}
+        run: python sync_garmin_gear.py
+
+      - name: Commit updated km.json
+        run: |
+          git config user.name "garmin-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add km.json
+          git diff --quiet --cached || git commit -m "Aktualizace km z Garmin Connect"
+          git push

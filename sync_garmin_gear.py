@@ -26,7 +26,12 @@ def main() -> None:
     api = Garmin(email, password)
     api.login()
 
-    gear_list = api.get_gear(api.get_full_name())
+    # Číselné ID profilu nejde uhodnout ze jména - Garmin ho vrací
+    # jako součást informací o naposledy použitém zařízení.
+    last_used_device = api.get_device_last_used()
+    user_profile_number = last_used_device["userProfileNumber"]
+
+    gear_list = api.get_gear(user_profile_number)
 
     # Vypíšeme si SUROVÁ data pro ladění - uvidíme přesně, jak Garmin
     # pojmenovává pole (název kola, ujeté km...). Tohle se objeví v logu

@@ -58,12 +58,18 @@ def main() -> None:
     print("Vybrané vybavení:")
     print(json.dumps(chosen, indent=2, ensure_ascii=False))
 
+    # Základní záznam o vybavení neobsahuje nastřádané km - ty se
+    # zjišťují samostatným voláním pro konkrétní kus vybavení (podle uuid).
+    gear_stats = api.get_gear_stats(chosen["uuid"])
+    print("Statistiky vybavení:")
+    print(json.dumps(gear_stats, indent=2, ensure_ascii=False))
+
     # Pole s ujetou vzdáleností se může jmenovat různě podle verze API -
     # zkusíme několik obvyklých názvů.
     distance_meters = (
-        chosen.get("totalDistance")
-        or chosen.get("distance")
-        or chosen.get("totalDistanceInMeters")
+        gear_stats.get("totalDistance")
+        or gear_stats.get("distance")
+        or gear_stats.get("totalDistanceInMeters")
     )
 
     if distance_meters is None:

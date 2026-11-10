@@ -2,89 +2,122 @@
 Přečte z Garmin Connect nájezd km konkrétního kola (z vybavení / gear)
 a uloží ho do souboru km.json v tomto repozitáři.
 
-Přihlašovací údaje se čtou z proměnných prostředí GARMIN_EMAIL a GARMIN_PASSWORD
-(v GitHub Actions se nastavují jako "Secrets", nikdy nejsou vidět v kódu).
+Přihlašuje se API klíčem přes Garmin Connect Personal API (žádné heslo ani
+ověřovací kód). Klíč se čte z proměnné prostředí GARMIN_PERSONAL_API_KEY
+(v GitHub Actions uložený jako "Secret", nikdy není vidět v kódu).
+
+Pozn.: vybavení není v dokumentaci Personal API uvedené. Skript zkouší
+stejné adresy, jaké používá web Garmin Connect, a do logu vypíše, jak
+každý pokus dopadl. Když Garmin přístup k vybavení nepovolí, skončí chybou
+a km.json nechá beze změny.
 """
 
 import json
 import os
 import sys
 
-from garminconnect import Garmin
+from garmin_personal_api import (
+    GarminPersonalApiClient,
+    PersonalApiAuthenticator,
+    resolve_api_key,
+)
+from garmin_personal_api.errors import GarminPersonalApiError, HttpError
 
 GEAR_NAME_FILTER = os.environ.get("GEAR_NAME_FILTER", "")  # např. "Rose" - volitelné
+PROFILE_PK = os.environ.get("GARMIN_PROFILE_PK", "")       # volitelné číslo profilu
+
+
+def try_get(client, path, params=None):
+    """Zavolá adresu a vypíše výsledek. Vrací data, nebo None při chybě."""
+    try:
+        data = client.get(path, params=params)
+        print(f"  OK   {path}")
+        return data
+    except HttpError as error:
+        print(f"  HTTP {error.status_code}  {path}  {error.response_text.strip()[:200]}")
+    except GarminPersonalApiError as error:
+        print(f"  CHYBA  {path}  {str(error)[:200]}")
+    return None
+
+
+def find_profile_pk(client):
+    """Číselné ID profilu - Garmin ho vrací na několika místech."""
+    if PROFILE_PK:
+        return PROFILE_PK
+    attempts = [
+        ("/userprofile-service/userprofile/settings", ("id", "userProfilePk", "userProfileNumber")),
+        ("/device-service/deviceservice/mylastused", ("userProfileNumber",)),
+        ("/userprofile-service/socialProfile", ("profileId", "id")),
+    ]
+    for path, keys in attempts:
+        data = try_get(client, path)
+        if isinstance(data, dict):
+            for key in keys:
+                if data.get(key):
+                    return str(data[key])
+    return ""
+
+
+def gear_name_of(gear):
+    return gear.get("displayName") or gear.get("customMakeModel") or ""
 
 
 def main() -> None:
-    email = os.environ.get("GARMIN_EMAIL")
-    password = os.environ.get("GARMIN_PASSWORD")
-
-    if not email or not password:
-        print("Chybí GARMIN_EMAIL nebo GARMIN_PASSWORD v prostředí.", file=sys.stderr)
+    if not os.environ.get("GARMIN_PERSONAL_API_KEY"):
+        print("Chybí GARMIN_PERSONAL_API_KEY v prostředí.", file=sys.stderr)
         sys.exit(1)
 
-    api = Garmin(email, password)
-    api.login()
+    with PersonalApiAuthenticator() as authenticator:
+        token = authenticator.obtain_token(resolve_api_key())
+    print("Přihlášení API klíčem proběhlo.")
 
-    # Číselné ID profilu nejde uhodnout ze jména - Garmin ho vrací
-    # jako součást informací o naposledy použitém zařízení.
-    last_used_device = api.get_device_last_used()
-    user_profile_number = last_used_device["userProfileNumber"]
+    with GarminPersonalApiClient(token.access_token) as client:
+        print("Hledám číslo profilu:")
+        profile_pk = find_profile_pk(client)
+        if not profile_pk:
+            print("Nepodařilo se zjistit číslo profilu.", file=sys.stderr)
+            sys.exit(1)
 
-    gear_list = api.get_gear(user_profile_number)
+        print("Načítám seznam vybavení:")
+        gear_list = try_get(client, "/gear-service/gear/filterGear", {"userProfilePk": profile_pk})
+        if not isinstance(gear_list, list) or not gear_list:
+            print("Personal API nevrátilo žádné vybavení.", file=sys.stderr)
+            sys.exit(1)
 
-    # Vypíšeme si SUROVÁ data pro ladění - uvidíme přesně, jak Garmin
-    # pojmenovává pole (název kola, ujeté km...). Tohle se objeví v logu
-    # GitHub Actions, takže si podle toho můžeme upravit filtr/pole níž.
-    print("Nalezené vybavení:")
-    print(json.dumps(gear_list, indent=2, ensure_ascii=False))
+        print("Nalezené vybavení: " + ", ".join(gear_name_of(g) or "(bez názvu)" for g in gear_list))
 
-    if not gear_list:
-        print("Garmin nevrátil žádné vybavení.", file=sys.stderr)
-        sys.exit(1)
+        # Pokud je nastavený filtr podle jména, použijeme první shodu, jinak první položku.
+        chosen = None
+        if GEAR_NAME_FILTER:
+            for gear in gear_list:
+                if GEAR_NAME_FILTER.lower() in gear_name_of(gear).lower():
+                    chosen = gear
+                    break
+        if chosen is None:
+            chosen = gear_list[0]
+        print(f"Vybrané vybavení: {gear_name_of(chosen)}")
 
-    # Pokud je nastavený filtr podle jména, použijeme první shodu.
-    # Jinak vezmeme první položku v seznamu (uprav si dle potřeby po prvním běhu).
-    chosen = None
-    if GEAR_NAME_FILTER:
-        for gear in gear_list:
-            name = gear.get("displayName") or gear.get("customMakeModel") or ""
-            if GEAR_NAME_FILTER.lower() in name.lower():
-                chosen = gear
-                break
-    if chosen is None:
-        chosen = gear_list[0]
+        print("Načítám statistiky vybavení:")
+        gear_stats = try_get(client, f"/gear-service/gear/stats/{chosen.get('uuid')}")
+        if not isinstance(gear_stats, dict):
+            print("Personal API nevrátilo statistiky vybavení.", file=sys.stderr)
+            sys.exit(1)
 
-    print("Vybrané vybavení:")
-    print(json.dumps(chosen, indent=2, ensure_ascii=False))
-
-    # Základní záznam o vybavení neobsahuje nastřádané km - ty se
-    # zjišťují samostatným voláním pro konkrétní kus vybavení (podle uuid).
-    gear_stats = api.get_gear_stats(chosen["uuid"])
-    print("Statistiky vybavení:")
-    print(json.dumps(gear_stats, indent=2, ensure_ascii=False))
-
-    # Pole s ujetou vzdáleností se může jmenovat různě podle verze API -
-    # zkusíme několik obvyklých názvů.
     distance_meters = (
         gear_stats.get("totalDistance")
         or gear_stats.get("distance")
         or gear_stats.get("totalDistanceInMeters")
     )
-
     if distance_meters is None:
         print(
-            "Nepodařilo se najít pole se vzdáleností - podívej se do výpisu "
-            "výše a uprav skript podle skutečného názvu pole.",
+            "Ve statistikách chybí vzdálenost. Dostupná pole: " + ", ".join(sorted(gear_stats.keys())),
             file=sys.stderr,
         )
         sys.exit(1)
 
-    km = round(distance_meters / 1000, 1)
-
     output = {
-        "gear_name": chosen.get("displayName") or chosen.get("customMakeModel") or "",
-        "km": km,
+        "gear_name": gear_name_of(chosen),
+        "km": round(distance_meters / 1000, 1),
         "source": "garmin_connect",
     }
 

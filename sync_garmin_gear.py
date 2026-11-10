@@ -1,65 +1,25 @@
 """
-Přečte z Garmin Connect nájezd km konkrétního kola (z vybavení / gear)
-a uloží ho do souboru km.json v tomto repozitáři.
+ZKUŠEBNÍ VERZE - nic neukládá, km.json nechává beze změny.
 
-Přihlašuje se API klíčem přes Garmin Connect Personal API (žádné heslo ani
-ověřovací kód). Klíč se čte z proměnné prostředí GARMIN_PERSONAL_API_KEY
-(v GitHub Actions uložený jako "Secret", nikdy není vidět v kódu).
+Vypíše, kolik km mají od 20. 9. 2026 jednotlivé typy aktivit
+(silniční kolo, horské kolo...). Podle toho poznáme, jestli se dají
+jízdy na silničním a horském kole od sebe rozlišit.
 
-Pozn.: vybavení není v dokumentaci Personal API uvedené. Skript zkouší
-stejné adresy, jaké používá web Garmin Connect, a do logu vypíše, jak
-každý pokus dopadl. Když Garmin přístup k vybavení nepovolí, skončí chybou
-a km.json nechá beze změny.
+Do logu jdou jen součty - žádné názvy ani místa jízd.
 """
 
-import json
 import os
 import sys
+from datetime import date
 
 from garmin_personal_api import (
     GarminPersonalApiClient,
     PersonalApiAuthenticator,
     resolve_api_key,
 )
-from garmin_personal_api.errors import GarminPersonalApiError, HttpError
 
-GEAR_NAME_FILTER = os.environ.get("GEAR_NAME_FILTER", "")  # např. "Rose" - volitelné
-PROFILE_PK = os.environ.get("GARMIN_PROFILE_PK", "")       # volitelné číslo profilu
-
-
-def try_get(client, path, params=None):
-    """Zavolá adresu a vypíše výsledek. Vrací data, nebo None při chybě."""
-    try:
-        data = client.get(path, params=params)
-        print(f"  OK   {path}")
-        return data
-    except HttpError as error:
-        print(f"  HTTP {error.status_code}  {path}  {error.response_text.strip()[:200]}")
-    except GarminPersonalApiError as error:
-        print(f"  CHYBA  {path}  {str(error)[:200]}")
-    return None
-
-
-def find_profile_pk(client):
-    """Číselné ID profilu - Garmin ho vrací na několika místech."""
-    if PROFILE_PK:
-        return PROFILE_PK
-    attempts = [
-        ("/userprofile-service/userprofile/settings", ("id", "userProfilePk", "userProfileNumber")),
-        ("/device-service/deviceservice/mylastused", ("userProfileNumber",)),
-        ("/userprofile-service/socialProfile", ("profileId", "id")),
-    ]
-    for path, keys in attempts:
-        data = try_get(client, path)
-        if isinstance(data, dict):
-            for key in keys:
-                if data.get(key):
-                    return str(data[key])
-    return ""
-
-
-def gear_name_of(gear):
-    return gear.get("displayName") or gear.get("customMakeModel") or ""
+SINCE = "2026-09-20"   # den poslední úspěšné synchronizace (7937,2 km)
+PAGE_SIZE = 100
 
 
 def main() -> None:
@@ -69,62 +29,46 @@ def main() -> None:
 
     with PersonalApiAuthenticator() as authenticator:
         token = authenticator.obtain_token(resolve_api_key())
-    print("Přihlášení API klíčem proběhlo.")
 
+    activities = []
     with GarminPersonalApiClient(token.access_token) as client:
-        print("Hledám číslo profilu:")
-        profile_pk = find_profile_pk(client)
-        if not profile_pk:
-            print("Nepodařilo se zjistit číslo profilu.", file=sys.stderr)
-            sys.exit(1)
+        start = 0
+        while True:
+            page = client.search_activities(
+                start=start, limit=PAGE_SIZE,
+                start_date=SINCE, end_date=date.today().isoformat(),
+            )
+            if isinstance(page, dict):
+                page = next((v for v in page.values() if isinstance(v, list)), [])
+            if not page:
+                break
+            activities.extend(page)
+            if len(page) < PAGE_SIZE or start > 20000:
+                break
+            start += PAGE_SIZE
 
-        print("Načítám seznam vybavení:")
-        gear_list = try_get(client, "/gear-service/gear/filterGear", {"userProfilePk": profile_pk})
-        if not isinstance(gear_list, list) or not gear_list:
-            print("Personal API nevrátilo žádné vybavení.", file=sys.stderr)
-            sys.exit(1)
+    print(f"Aktivit od {SINCE}: {len(activities)}")
+    if activities:
+        print("Pole v odpovědi: " + ", ".join(sorted(activities[0].keys())))
 
-        print("Nalezené vybavení: " + ", ".join(gear_name_of(g) or "(bez názvu)" for g in gear_list))
+    totals = {}      # typ -> [počet, metry] od 21. 9.
+    first_day = {}   # typ -> [počet, metry] jen 20. 9.
+    for activity in activities:
+        day = str(activity.get("startTimeLocal") or activity.get("startTimeGMT") or "")[:10]
+        type_key = str((activity.get("activityType") or {}).get("typeKey") or "neznamy")
+        meters = float(activity.get("distance") or 0)
+        bucket = first_day if day == SINCE else totals
+        entry = bucket.setdefault(type_key, [0, 0.0])
+        entry[0] += 1
+        entry[1] += meters
 
-        # Pokud je nastavený filtr podle jména, použijeme první shodu, jinak první položku.
-        chosen = None
-        if GEAR_NAME_FILTER:
-            for gear in gear_list:
-                if GEAR_NAME_FILTER.lower() in gear_name_of(gear).lower():
-                    chosen = gear
-                    break
-        if chosen is None:
-            chosen = gear_list[0]
-        print(f"Vybrané vybavení: {gear_name_of(chosen)}")
-
-        print("Načítám statistiky vybavení:")
-        gear_stats = try_get(client, f"/gear-service/gear/stats/{chosen.get('uuid')}")
-        if not isinstance(gear_stats, dict):
-            print("Personal API nevrátilo statistiky vybavení.", file=sys.stderr)
-            sys.exit(1)
-
-    distance_meters = (
-        gear_stats.get("totalDistance")
-        or gear_stats.get("distance")
-        or gear_stats.get("totalDistanceInMeters")
-    )
-    if distance_meters is None:
-        print(
-            "Ve statistikách chybí vzdálenost. Dostupná pole: " + ", ".join(sorted(gear_stats.keys())),
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    output = {
-        "gear_name": gear_name_of(chosen),
-        "km": round(distance_meters / 1000, 1),
-        "source": "garmin_connect",
-    }
-
-    with open("km.json", "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
-
-    print(f"Uloženo: {output}")
+    print(f"Součty od 21. 9. 2026 (bez dne {SINCE}):")
+    for type_key, (count, meters) in sorted(totals.items()):
+        print(f"  {type_key}: {count} aktivit, {meters / 1000:.1f} km")
+    print(f"Jen den {SINCE}:")
+    for type_key, (count, meters) in sorted(first_day.items()):
+        print(f"  {type_key}: {count} aktivit, {meters / 1000:.1f} km")
+    print("Pro srovnání: Garmin u kola Rose ukazuje 9709 km, při poslední synchronizaci 7937,2 km -> rozdíl 1771,8 km.")
 
 
 if __name__ == "__main__":

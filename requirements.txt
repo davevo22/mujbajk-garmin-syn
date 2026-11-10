@@ -1,1 +1,1 @@
-garminconnect
+garmin-connect-personal-api-python

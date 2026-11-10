@@ -1,5 +1,15 @@
 {
   "gear_name": "Rose Xlite 06",
-  "km": 7937.2,
-  "source": "garmin_connect"
+  "km": 9708.9,
+  "source": "garmin_personal_api",
+  "bikes": [
+    {
+      "gear_name": "Rose Xlite 06",
+      "km": 9708.9
+    },
+    {
+      "gear_name": "Mondraker Podium",
+      "km": 2350.8
+    }
+  ]
 }
